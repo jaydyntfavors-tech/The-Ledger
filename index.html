@@ -595,62 +595,82 @@ function ReportSection({ title, children }) {
     </div>
   );
 }
-
 function InsightsTab({ income, categories, debtInfo, savingsGoal }) {
   const [loading, setLoading] = useState(false);
   const [report, setReport] = useState(null);
   const [error, setError] = useState("");
-  const [available, setAvailable] = useState(null);
+  const [apiKey, setApiKey] = useState(() => window.localStorage.getItem("gemini_api_key") || "");
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const sample = await window.claude.use("sample");
-        setAvailable(!!sample);
-      } catch (e) {
-        setAvailable(false);
-      }
-    })();
-  }, []);
+  const handleKeyChange = (val) => {
+    setApiKey(val);
+    window.localStorage.setItem("gemini_api_key", val);
+  };
 
   const summary = useMemo(() => CATEGORY_CONFIG.map((c) => {
     const total = categories[c.key].reduce((s, it) => s + (Number(it.amount) || 0), 0);
     return {
-      category: c.label, target_pct: c.target, actual_amount: total,
+      category: c.label,
+      target_pct: c.target,
+      actual_amount: total,
       actual_pct: income > 0 ? total / income : 0,
       line_items: categories[c.key].map((it) => ({ name: it.name, amount: it.amount })),
     };
   }), [categories, income]);
 
   const getInsights = async () => {
-    setLoading(true); setError(""); setReport(null);
+    if (!apiKey.trim()) {
+      setError("Please provide a Gemini API key first.");
+      return;
+    }
+    setLoading(true);
+    setError("");
+    setReport(null);
+
+    const promptText = `You are a plain-spoken budgeting coach. A user tracks their budget against the 50/30/20 rule (50% needs, 30% wants, 20% combined savings+debt).
+Monthly income: ${income}
+Budget by category: ${JSON.stringify(summary, null, 2)}
+Debt details: ${JSON.stringify(debtInfo)}
+Savings goal: ${JSON.stringify(savingsGoal)}
+
+Respond with strict JSON matching this exact structure:
+{
+  "health_score": { "score": <integer 1-10>, "reason": "<1-2 sentences>" },
+  "category_analysis": { "needs": "<1-2 sentences>", "wants": "<1-2 sentences>", "savings": "<1-2 sentences>", "debt": "<1-2 sentences>" },
+  "goal_timeline": { "summary": "<exact timeline in years/months>", "realistic": <true or false>, "note": "<brief note>" },
+  "cost_changes": [ { "change": "<specific concrete change>", "estimated_savings": "<$ amount per month>" } ],
+  "action_plan": [ "<action 1>", "<action 2>", "<action 3>" ],
+  "caution": "<brief warning if debt/cashflow is risky, else empty string>",
+  "recommendations": "<2-3 sentences of general suggestions>"
+}`;
+
     try {
-      const sample = await window.claude.use("sample");
-      if (!sample) { setError("AI insights aren't available in this view."); setLoading(false); return; }
-      const prompt =
-        "You are a plain-spoken budgeting coach. A person tracks their budget against the 50/30/20 rule " +
-        "(50% needs, 30% wants, 20% combined savings+debt). Here is their data, as JSON:\n\n" +
-        `Monthly income: ${income}\n` +
-        `Budget by category: ${JSON.stringify(summary, null, 2)}\n` +
-        `Debt details: ${JSON.stringify(debtInfo)}\n` +
-        `Savings goal: ${JSON.stringify(savingsGoal)}\n\n` +
-        "Respond with ONLY a JSON object (no markdown fences, no commentary) with exactly this shape:\n" +
-        "{\n" +
-        '  "health_score": { "score": <integer 1-10>, "reason": "<one or two sentences>" },\n' +
-        '  "category_analysis": { "needs": "<1-2 sentences>", "wants": "<1-2 sentences>", "savings": "<1-2 sentences>", "debt": "<1-2 sentences>" },\n' +
-        '  "goal_timeline": { "summary": "<the exact timeline in years/months given their current contribution>", "realistic": <true or false>, "note": "<why, briefly>" },\n' +
-        '  "cost_changes": [ { "change": "<specific, concrete change>", "estimated_savings": "<dollar amount per month>" }, ... exactly 3 items ],\n' +
-        '  "action_plan": [ "<specific action for next month>", ... 3 to 5 items ],\n' +
-        '  "caution": "<a brief warning if cash flow, debt, or emergency fund looks risky, otherwise an empty string>",\n' +
-        '  "recommendations": "<2-3 sentences of general suggestions to improve the budget structure itself>"\n' +
-        "}\n\n" +
-        "If there is no savings goal set (target is 0), say so plainly in goal_timeline instead of inventing one. " +
-        "Do not recommend any specific stock, fund, account provider, or investment product, and do not give " +
-        "personalized investment advice — general budgeting and saving habits only. Keep every field concise.";
-      const result = await sample.json(prompt, { modelTier: "default" });
-      setReport(result);
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey.trim()}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: promptText }] }],
+            generationConfig: {
+              responseMimeType: "application/json"
+            }
+          })
+        }
+      );
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error?.message || `API Error: ${response.status}`);
+      }
+
+      const data = await response.json();
+      const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!rawText) throw new Error("No response generated from Gemini.");
+
+      const parsed = JSON.parse(rawText);
+      setReport(parsed);
     } catch (e) {
-      setError("Couldn't reach the insights service just now. Try again in a moment.");
+      setError(e.message || "Failed to generate report. Check your Gemini API key and try again.");
     } finally {
       setLoading(false);
     }
@@ -663,32 +683,35 @@ function InsightsTab({ income, categories, debtInfo, savingsGoal }) {
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, gap: 12, flexWrap: "wrap" }}>
         <div style={{ fontFamily: "'IBM Plex Sans', sans-serif", fontSize: 13, color: "var(--muted)", maxWidth: 420 }}>
-          A full budget report: health score, category-by-category read, your savings goal timeline, concrete
-          cost changes, and a next-month plan. Not financial or investment advice.
+          A full budget report powered by <strong>Google Gemini</strong>: health score, category breakdown, timeline, and actionable plans.
         </div>
-        <button
-          onClick={getInsights}
-          disabled={loading || available === false}
-          style={{ display: "flex", alignItems: "center", gap: 8, background: "var(--ink)", color: "var(--bg)", border: "none", borderRadius: 4, padding: "10px 16px", fontFamily: "'IBM Plex Sans', sans-serif", fontSize: 13, fontWeight: 600, cursor: loading ? "default" : "pointer", opacity: loading || available === false ? 0.6 : 1, whiteSpace: "nowrap" }}
-        >
-          {loading ? <span className="spin" /> : "✨"}
-          {loading ? "Building your report…" : "Get budget report"}
-        </button>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <input
+            type="password"
+            placeholder="Gemini API Key"
+            value={apiKey}
+            onChange={(e) => handleKeyChange(e.target.value)}
+            style={{ padding: "8px 10px", border: "1px solid var(--line)", borderRadius: 4, fontFamily: "'IBM Plex Sans', sans-serif", fontSize: 13, background: "var(--paper)", color: "var(--ink)" }}
+          />
+          <button
+            onClick={getInsights}
+            disabled={loading}
+            style={{ display: "flex", alignItems: "center", gap: 8, background: "var(--ink)", color: "var(--bg)", border: "none", borderRadius: 4, padding: "10px 16px", fontFamily: "'IBM Plex Sans', sans-serif", fontSize: 13, fontWeight: 600, cursor: loading ? "default" : "pointer", opacity: loading ? 0.6 : 1, whiteSpace: "nowrap" }}
+          >
+            {loading ? <span className="spin" /> : "✨"}
+            {loading ? "Analyzing…" : "Get Gemini Report"}
+          </button>
+        </div>
       </div>
 
-      {available === false && (
-        <div style={{ color: "var(--muted)", fontFamily: "'IBM Plex Sans', sans-serif", fontSize: 13, marginBottom: 12 }}>
-          AI insights aren't available in this view.
-        </div>
-      )}
       {error && <div style={{ color: "var(--danger)", fontFamily: "'IBM Plex Sans', sans-serif", fontSize: 13, marginBottom: 12 }}>{error}</div>}
 
       {report ? (
         <div style={{ background: "var(--paper)", border: "1px solid var(--line)", borderRadius: 4, padding: "20px 22px" }}>
           <ReportSection title="1 · Budget health score">
             <div style={{ display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
-              <ScoreDial score={report.health_score && report.health_score.score} />
-              <p style={{ ...p, flex: 1, minWidth: 200 }}>{report.health_score && report.health_score.reason}</p>
+              <ScoreDial score={report.health_score?.score} />
+              <p style={{ ...p, flex: 1, minWidth: 200 }}>{report.health_score?.reason}</p>
             </div>
           </ReportSection>
 
@@ -696,7 +719,7 @@ function InsightsTab({ income, categories, debtInfo, savingsGoal }) {
             {CATEGORY_CONFIG.map((c) => (
               <div key={c.key} style={{ display: "flex", gap: 10, marginBottom: 8 }}>
                 <span style={{ width: 9, height: 9, borderRadius: "50%", background: c.color, flexShrink: 0, marginTop: 6 }} />
-                <p style={p}><strong>{c.label}:</strong> {report.category_analysis && report.category_analysis[c.key]}</p>
+                <p style={p}><strong>{c.label}:</strong> {report.category_analysis?.[c.key]}</p>
               </div>
             ))}
           </ReportSection>
@@ -741,16 +764,15 @@ function InsightsTab({ income, categories, debtInfo, savingsGoal }) {
           </ReportSection>
         </div>
       ) : (
-        !loading && available !== false && (
+        !loading && (
           <div style={{ border: "1px dashed var(--line)", borderRadius: 4, padding: "24px 20px", textAlign: "center", color: "var(--muted)", fontFamily: "'IBM Plex Sans', sans-serif", fontSize: 13 }}>
-            No report yet — press "Get budget report" above.
+            Enter your Gemini API key above and click "Get Gemini Report".
           </div>
         )
       )}
     </div>
   );
 }
-
 /* ---------- main app ---------- */
 function BudgetLedger() {
   const [loaded, setLoaded] = useState(false);
