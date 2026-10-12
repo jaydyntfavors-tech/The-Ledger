@@ -1,5 +1,5 @@
 export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+  //if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
   const { prompt } = req.body;
   const apiKey = process.env.GEMINI_API_KEY;
